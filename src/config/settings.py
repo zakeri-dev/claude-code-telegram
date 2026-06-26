@@ -201,15 +201,29 @@ class Settings(BaseSettings):
     enable_voice_messages: bool = Field(
         True, description="Enable voice message transcription"
     )
-    voice_provider: Literal["mistral", "openai", "local"] = Field(
+    voice_provider: Literal["mistral", "openai", "local", "elevenlabs"] = Field(
         "mistral",
-        description="Voice transcription provider: 'mistral', 'openai', or 'local'",
+        description=(
+            "Voice transcription provider: "
+            "'mistral', 'openai', 'local', or 'elevenlabs'"
+        ),
     )
     mistral_api_key: Optional[SecretStr] = Field(
         None, description="Mistral API key for voice transcription"
     )
     openai_api_key: Optional[SecretStr] = Field(
         None, description="OpenAI API key for Whisper voice transcription"
+    )
+    elevenlabs_api_key: Optional[SecretStr] = Field(
+        None, description="ElevenLabs API key for Scribe voice transcription"
+    )
+    elevenlabs_proxy: Optional[str] = Field(
+        None,
+        description=(
+            "Optional HTTP/SOCKS proxy URL for ElevenLabs requests "
+            "(e.g. http://host:port or socks5://host:port). "
+            "Use when ElevenLabs is geo-blocked on the bot's network."
+        ),
     )
     voice_transcription_model: Optional[str] = Field(
         None,
@@ -241,6 +255,23 @@ class Settings(BaseSettings):
             "(e.g. 'base', 'small'). Defaults to 'base'. "
             "Named models resolve to ~/.cache/whisper-cpp/ggml-{name}.bin"
         ),
+    )
+    # Video frame sampling for vision analysis (requires ffmpeg on the server)
+    enable_video_messages: bool = Field(
+        True,
+        description="Enable video analysis via frame sampling (needs ffmpeg)",
+    )
+    video_max_file_size_mb: int = Field(
+        50,
+        description="Maximum Telegram video size (MB) that will be downloaded",
+        ge=1,
+        le=200,
+    )
+    video_frame_count: int = Field(
+        6,
+        description="Number of frames to sample evenly across the video",
+        ge=1,
+        le=20,
     )
     enable_quick_actions: bool = Field(True, description="Enable quick action buttons")
     agentic_mode: bool = Field(
@@ -442,9 +473,10 @@ class Settings(BaseSettings):
         if v is None:
             return "mistral"
         provider = str(v).strip().lower()
-        if provider not in {"mistral", "openai", "local"}:
+        if provider not in {"mistral", "openai", "local", "elevenlabs"}:
             raise ValueError(
-                "voice_provider must be one of ['mistral', 'openai', 'local']"
+                "voice_provider must be one of "
+                "['mistral', 'openai', 'local', 'elevenlabs']"
             )
         return provider
 
@@ -546,6 +578,15 @@ class Settings(BaseSettings):
         return self.openai_api_key.get_secret_value() if self.openai_api_key else None
 
     @property
+    def elevenlabs_api_key_str(self) -> Optional[str]:
+        """Get ElevenLabs API key as string."""
+        return (
+            self.elevenlabs_api_key.get_secret_value()
+            if self.elevenlabs_api_key
+            else None
+        )
+
+    @property
     def resolved_voice_model(self) -> str:
         """Get the voice transcription model, with provider-specific defaults."""
         if self.voice_transcription_model:
@@ -554,6 +595,8 @@ class Settings(BaseSettings):
             return "whisper-1"
         if self.voice_provider == "local":
             return self.whisper_cpp_model_path or "base"
+        if self.voice_provider == "elevenlabs":
+            return "scribe_v1"
         return "voxtral-mini-latest"
 
     @property
@@ -568,6 +611,8 @@ class Settings(BaseSettings):
             return "OPENAI_API_KEY"
         if self.voice_provider == "local":
             return ""
+        if self.voice_provider == "elevenlabs":
+            return "ELEVENLABS_API_KEY"
         return "MISTRAL_API_KEY"
 
     @property
@@ -577,6 +622,8 @@ class Settings(BaseSettings):
             return "OpenAI Whisper"
         if self.voice_provider == "local":
             return "Local whisper.cpp"
+        if self.voice_provider == "elevenlabs":
+            return "ElevenLabs Scribe"
         return "Mistral Voxtral"
 
     @property

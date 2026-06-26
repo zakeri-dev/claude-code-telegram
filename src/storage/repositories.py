@@ -8,7 +8,7 @@ Features:
 
 import json
 from datetime import UTC, datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import structlog
 
@@ -525,7 +525,7 @@ class ToolUsageRepository:
             rows = await cursor.fetchall()
             return [ToolUsageModel.from_row(row) for row in rows]
 
-    async def get_tool_stats(self) -> List[Dict[str, any]]:
+    async def get_tool_stats(self) -> List[Dict[str, Any]]:
         """Get tool usage statistics."""
         async with self.db.get_connection() as conn:
             cursor = await conn.execute(
@@ -651,7 +651,7 @@ class CostTrackingRepository:
             rows = await cursor.fetchall()
             return [CostTrackingModel.from_row(row) for row in rows]
 
-    async def get_total_costs(self, days: int = 30) -> List[Dict[str, any]]:
+    async def get_total_costs(self, days: int = 30) -> List[Dict[str, Any]]:
         """Get total costs by day."""
         async with self.db.get_connection() as conn:
             cursor = await conn.execute(
@@ -679,7 +679,7 @@ class AnalyticsRepository:
         """Initialize repository."""
         self.db = db_manager
 
-    async def get_user_stats(self, user_id: int) -> Dict[str, any]:
+    async def get_user_stats(self, user_id: int) -> Dict[str, Any]:
         """Get user statistics."""
         async with self.db.get_connection() as conn:
             # User summary
@@ -742,7 +742,7 @@ class AnalyticsRepository:
                 "top_tools": top_tools,
             }
 
-    async def get_system_stats(self) -> Dict[str, any]:
+    async def get_system_stats(self) -> Dict[str, Any]:
         """Get system-wide statistics."""
         async with self.db.get_connection() as conn:
             # Overall stats

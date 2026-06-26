@@ -16,6 +16,7 @@ from .git_integration import GitIntegration
 from .image_handler import ImageHandler
 from .quick_actions import QuickActionManager
 from .session_export import SessionExporter
+from .video_handler import VideoHandler
 from .voice_handler import VoiceHandler
 
 logger = structlog.get_logger(__name__)
@@ -78,11 +79,27 @@ class FeatureRegistry:
         except Exception as e:
             logger.error("Failed to initialize image handler", error=str(e))
 
+        # Video frame sampling - requires ffmpeg on the server
+        if self.config.enable_video_messages:
+            try:
+                video_handler = VideoHandler(config=self.config)
+                if video_handler.available:
+                    self.features["video_handler"] = video_handler
+                    logger.info("Video handler feature enabled")
+                else:
+                    logger.warning("Video handler disabled: ffmpeg not found on PATH")
+            except Exception as e:
+                logger.error("Failed to initialize video handler", error=str(e))
+
         # Voice transcription - requires provider-specific API key (or local)
         voice_key_available = (
             (self.config.voice_provider == "local")
             or (self.config.voice_provider == "openai" and self.config.openai_api_key)
             or (self.config.voice_provider == "mistral" and self.config.mistral_api_key)
+            or (
+                self.config.voice_provider == "elevenlabs"
+                and self.config.elevenlabs_api_key
+            )
         )
         if self.config.enable_voice_messages and voice_key_available:
             try:
@@ -131,6 +148,10 @@ class FeatureRegistry:
     def get_image_handler(self) -> Optional[ImageHandler]:
         """Get image handler feature"""
         return self.get_feature("image_handler")
+
+    def get_video_handler(self) -> Optional[VideoHandler]:
+        """Get video handler feature"""
+        return self.get_feature("video_handler")
 
     def get_voice_handler(self) -> Optional[VoiceHandler]:
         """Get voice handler feature"""

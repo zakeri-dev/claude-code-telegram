@@ -91,6 +91,8 @@ class VoiceHandler:
             transcription = await self._transcribe_local(voice_bytes)
         elif self.config.voice_provider == "openai":
             transcription = await self._transcribe_openai(voice_bytes)
+        elif self.config.voice_provider == "elevenlabs":
+            transcription = await self._transcribe_elevenlabs(voice_bytes)
         else:
             transcription = await self._transcribe_mistral(voice_bytes)
 
@@ -201,6 +203,43 @@ class VoiceHandler:
 
         self._openai_client = AsyncOpenAI(api_key=api_key)
         return self._openai_client
+
+    # -- ElevenLabs provider --
+
+    async def _transcribe_elevenlabs(self, voice_bytes: bytes) -> str:
+        """Transcribe audio using the ElevenLabs Speech-to-Text API (Scribe)."""
+        import httpx
+
+        api_key = self.config.elevenlabs_api_key_str
+        if not api_key:
+            raise RuntimeError("ElevenLabs API key is not configured.")
+
+        # Optional proxy: ElevenLabs (Google-hosted) geo-blocks some regions.
+        proxy = getattr(self.config, "elevenlabs_proxy", None) or None
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.LOCAL_SUBPROCESS_TIMEOUT, proxy=proxy
+            ) as client:
+                response = await client.post(
+                    "https://api.elevenlabs.io/v1/speech-to-text",
+                    headers={"xi-api-key": api_key},
+                    data={"model_id": self.config.resolved_voice_model},
+                    files={"file": ("voice.ogg", voice_bytes, "audio/ogg")},
+                )
+                response.raise_for_status()
+                payload = response.json()
+        except Exception as exc:
+            logger.warning(
+                "ElevenLabs transcription request failed",
+                error_type=type(exc).__name__,
+            )
+            raise RuntimeError("ElevenLabs transcription request failed.") from exc
+
+        text = (payload.get("text", "") or "").strip()
+        if not text:
+            raise ValueError("ElevenLabs transcription returned an empty response.")
+        return text
 
     # -- Local whisper.cpp provider --
 

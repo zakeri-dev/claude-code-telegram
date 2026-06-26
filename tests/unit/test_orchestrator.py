@@ -83,7 +83,8 @@ def deps():
 
 
 def test_agentic_registers_6_commands(agentic_settings, deps):
-    """Agentic mode registers start, new, status, verbose, repo, restart commands."""
+    """Agentic mode registers start, new, status, summary, dashboard, verbose,
+    repo, restart commands."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     app = MagicMock()
     app.add_handler = MagicMock()
@@ -100,10 +101,13 @@ def test_agentic_registers_6_commands(agentic_settings, deps):
     ]
     commands = [h[0][0].commands for h in cmd_handlers]
 
-    assert len(cmd_handlers) == 6
+    assert len(cmd_handlers) == 9
     assert frozenset({"start"}) in commands
     assert frozenset({"new"}) in commands
     assert frozenset({"status"}) in commands
+    assert frozenset({"summary"}) in commands
+    assert frozenset({"dashboard"}) in commands
+    assert frozenset({"sessions"}) in commands
     assert frozenset({"verbose"}) in commands
     assert frozenset({"repo"}) in commands
     assert frozenset({"restart"}) in commands
@@ -129,7 +133,7 @@ def test_classic_registers_14_commands(classic_settings, deps):
 
 
 def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
-    """Agentic mode registers text, document, photo, and voice message handlers."""
+    """Agentic mode registers text, document, photo, video, and voice handlers."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     app = MagicMock()
     app.add_handler = MagicMock()
@@ -149,20 +153,30 @@ def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
         if isinstance(call[0][0], CallbackQueryHandler)
     ]
 
-    # 5 message handlers (text, document, photo, voice, unknown commands passthrough)
-    assert len(msg_handlers) == 5
-    # 2 callback handlers (stop: + cd:)
-    assert len(cb_handlers) == 2
+    # 6 message handlers (text, document, photo, video, voice, unknown passthrough)
+    assert len(msg_handlers) == 6
+    # 3 callback handlers (stop: + cd: + sess:)
+    assert len(cb_handlers) == 3
 
 
 async def test_agentic_bot_commands(agentic_settings, deps):
-    """Agentic mode returns 6 bot commands."""
+    """Agentic mode returns the expected bot commands."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     commands = await orchestrator.get_bot_commands()
 
-    assert len(commands) == 6
+    assert len(commands) == 9
     cmd_names = [c.command for c in commands]
-    assert cmd_names == ["start", "new", "status", "verbose", "repo", "restart"]
+    assert cmd_names == [
+        "start",
+        "new",
+        "status",
+        "summary",
+        "dashboard",
+        "sessions",
+        "verbose",
+        "repo",
+        "restart",
+    ]
 
 
 async def test_classic_bot_commands(classic_settings, deps):
@@ -176,6 +190,197 @@ async def test_classic_bot_commands(classic_settings, deps):
     assert "help" in cmd_names
     assert "git" in cmd_names
     assert "restart" in cmd_names
+
+
+async def test_agentic_summary_reports_session(agentic_settings, deps):
+    """/summary reports the current session's message/cost/tool stats."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    storage = MagicMock()
+    storage.sessions.get_session = AsyncMock(
+        return_value=SimpleNamespace(message_count=4, total_turns=4, total_cost=0.0)
+    )
+    storage.tools.get_session_tool_usage = AsyncMock(
+        return_value=[
+            SimpleNamespace(tool_name="Read"),
+            SimpleNamespace(tool_name="Read"),
+            SimpleNamespace(tool_name="Edit"),
+        ]
+    )
+    audit = MagicMock()
+    audit.log_command = AsyncMock()
+
+    update = MagicMock()
+    update.effective_user.id = 7
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.bot_data = {"storage": storage, "audit_logger": audit}
+    context.user_data = {"claude_session_id": "sess-1", "current_directory": "/tmp/p"}
+
+    await orchestrator.agentic_summary(update, context)
+
+    text = update.message.reply_text.call_args[0][0]
+    assert "Session summary" in text
+    assert "Read ×2" in text
+    audit.log_command.assert_awaited_once()
+
+
+async def test_agentic_summary_without_session(agentic_settings, deps):
+    """/summary tells the user when there is no active session."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+    update = MagicMock()
+    update.effective_user.id = 7
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.bot_data = {"storage": MagicMock()}
+    context.user_data = {}
+
+    await orchestrator.agentic_summary(update, context)
+
+    text = update.message.reply_text.call_args[0][0]
+    assert "No active session" in text
+
+
+async def test_agentic_dashboard_reports_usage(agentic_settings, deps):
+    """/dashboard reports usage stats, budget, and top tools."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    storage = MagicMock()
+    storage.get_user_dashboard = AsyncMock(
+        return_value={
+            "stats": {
+                "summary": {
+                    "total_sessions": 3,
+                    "total_messages": 12,
+                    "total_cost": 0.0,
+                },
+                "top_tools": [{"tool_name": "Bash", "usage_count": 5}],
+            }
+        }
+    )
+    rate_limiter = MagicMock()
+    rate_limiter.get_user_status = MagicMock(
+        return_value={"cost_usage": {"current": 0.0, "limit": 10.0, "remaining": 10.0}}
+    )
+    audit = MagicMock()
+    audit.log_command = AsyncMock()
+
+    update = MagicMock()
+    update.effective_user.id = 7
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.bot_data = {
+        "storage": storage,
+        "rate_limiter": rate_limiter,
+        "audit_logger": audit,
+    }
+    context.user_data = {}
+
+    await orchestrator.agentic_dashboard(update, context)
+
+    text = update.message.reply_text.call_args[0][0]
+    assert "Your dashboard" in text
+    assert "Sessions: 3" in text
+    assert "Bash ×5" in text
+    audit.log_command.assert_awaited_once()
+
+
+async def test_agentic_sessions_lists_with_buttons(agentic_settings, deps):
+    """/sessions lists sessions and offers a switch button per session."""
+    from datetime import UTC, datetime
+
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+    storage = MagicMock()
+    storage.sessions.get_user_sessions = AsyncMock(
+        return_value=[
+            SimpleNamespace(
+                session_id="s1",
+                project_path="/work/proj-a",
+                message_count=5,
+                last_used=datetime.now(UTC),
+            ),
+            SimpleNamespace(
+                session_id="s2",
+                project_path="/work/proj-b",
+                message_count=2,
+                last_used=datetime.now(UTC),
+            ),
+        ]
+    )
+    audit = MagicMock()
+    audit.log_command = AsyncMock()
+
+    update = MagicMock()
+    update.effective_user.id = 7
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.bot_data = {"storage": storage, "audit_logger": audit}
+    context.user_data = {"claude_session_id": "s1"}
+
+    await orchestrator.agentic_sessions(update, context)
+
+    text = update.message.reply_text.call_args[0][0]
+    markup = update.message.reply_text.call_args.kwargs["reply_markup"]
+    assert "Your sessions" in text
+    assert "proj-a" in text
+    assert len(markup.inline_keyboard) == 2
+    audit.log_command.assert_awaited_once()
+
+
+async def test_agentic_session_callback_switches(agentic_settings, deps):
+    """Tapping a session button resumes that session and its directory."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+    storage = MagicMock()
+    storage.sessions.get_session = AsyncMock(
+        return_value=SimpleNamespace(
+            session_id="s2", project_path="/work/proj-b", message_count=2
+        )
+    )
+
+    update = MagicMock()
+    update.effective_user.id = 7
+    query = update.callback_query
+    query.data = "sess:s2"
+    query.answer = AsyncMock()
+    query.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.bot_data = {"storage": storage}
+    context.user_data = {}
+
+    await orchestrator._agentic_session_callback(update, context)
+
+    assert context.user_data["claude_session_id"] == "s2"
+    assert str(context.user_data["current_directory"]).endswith("proj-b")
+    query.message.reply_text.assert_awaited_once()
+
+
+def test_append_tool_footer_lists_unique_tools(agentic_settings):
+    """Tool footer lists unique tools used, appended to the last message."""
+    from src.bot.utils.formatting import FormattedMessage
+
+    orch = MessageOrchestrator(agentic_settings, {})
+    msgs = [FormattedMessage("Done.", parse_mode="HTML")]
+    resp = SimpleNamespace(
+        tools_used=[{"name": "Read"}, {"name": "Edit"}, {"name": "Read"}]
+    )
+
+    orch._append_tool_footer(msgs, resp)
+
+    assert "🛠️" in msgs[-1].text
+    assert "Read" in msgs[-1].text
+    assert "Edit" in msgs[-1].text
+
+
+def test_append_tool_footer_noop_without_tools(agentic_settings):
+    """No footer is added when Claude used no tools."""
+    from src.bot.utils.formatting import FormattedMessage
+
+    orch = MessageOrchestrator(agentic_settings, {})
+    msgs = [FormattedMessage("Hi.", parse_mode="HTML")]
+
+    orch._append_tool_footer(msgs, SimpleNamespace(tools_used=[]))
+
+    assert msgs[0].text == "Hi."
 
 
 async def test_restart_command_sends_sigterm(deps):
@@ -338,7 +543,7 @@ async def test_agentic_callback_scoped_to_cd_pattern(agentic_settings, deps):
         if isinstance(call[0][0], CallbackQueryHandler)
     ]
 
-    assert len(cb_handlers) == 2
+    assert len(cb_handlers) == 3
     # Find the cd: handler by pattern
     cd_handler = [h for h in cb_handlers if h.pattern and h.pattern.match("cd:x")]
     assert len(cd_handler) == 1
@@ -346,6 +551,9 @@ async def test_agentic_callback_scoped_to_cd_pattern(agentic_settings, deps):
     # Also has a stop: handler
     stop_handler = [h for h in cb_handlers if h.pattern and h.pattern.match("stop:1")]
     assert len(stop_handler) == 1
+    # Also has a sess: handler
+    sess_handler = [h for h in cb_handlers if h.pattern and h.pattern.match("sess:x")]
+    assert len(sess_handler) == 1
 
 
 async def test_agentic_document_rejects_large_files(agentic_settings, deps):

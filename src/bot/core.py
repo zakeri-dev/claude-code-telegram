@@ -41,6 +41,13 @@ class ClaudeCodeBot:
         self.feature_registry: Optional[FeatureRegistry] = None
         self.orchestrator = MessageOrchestrator(settings, dependencies)
 
+    @property
+    def application(self) -> Application:
+        """Return the initialized PTB Application (raises if not initialized)."""
+        if self.app is None:
+            raise RuntimeError("Bot not initialized; call initialize() first.")
+        return self.app
+
     async def initialize(self) -> None:
         """Initialize bot application. Idempotent — safe to call multiple times."""
         if self.app is not None:
@@ -102,19 +109,19 @@ class ClaudeCodeBot:
         self._add_middleware()
 
         # Set error handler
-        self.app.add_error_handler(self._error_handler)
+        self.application.add_error_handler(self._error_handler)
 
         logger.info("Bot initialization complete")
 
     async def _set_bot_commands(self) -> None:
         """Set bot command menu via orchestrator."""
         commands = await self.orchestrator.get_bot_commands()
-        await self.app.bot.set_my_commands(commands)
+        await self.application.bot.set_my_commands(commands)
         logger.info("Bot commands set", commands=[cmd.command for cmd in commands])
 
     def _register_handlers(self) -> None:
         """Register handlers via orchestrator (mode-aware)."""
-        self.orchestrator.register_handlers(self.app)
+        self.orchestrator.register_handlers(self.application)
 
     def _add_middleware(self) -> None:
         """Add middleware to application."""
@@ -124,7 +131,7 @@ class ClaudeCodeBot:
 
         # Middleware runs in order of group numbers (lower = earlier)
         # Security middleware first (validate inputs)
-        self.app.add_handler(
+        self.application.add_handler(
             MessageHandler(
                 filters.ALL, self._create_middleware_handler(security_middleware)
             ),
@@ -132,7 +139,7 @@ class ClaudeCodeBot:
         )
 
         # Authentication second
-        self.app.add_handler(
+        self.application.add_handler(
             MessageHandler(
                 filters.ALL, self._create_middleware_handler(auth_middleware)
             ),
@@ -140,7 +147,7 @@ class ClaudeCodeBot:
         )
 
         # Rate limiting third
-        self.app.add_handler(
+        self.application.add_handler(
             MessageHandler(
                 filters.ALL, self._create_middleware_handler(rate_limit_middleware)
             ),
@@ -213,7 +220,7 @@ class ClaudeCodeBot:
 
             if self.settings.webhook_url:
                 # Webhook mode
-                await self.app.run_webhook(
+                await self.application.run_webhook(
                     listen="0.0.0.0",
                     port=self.settings.webhook_port,
                     url_path=self.settings.webhook_path,
@@ -223,9 +230,12 @@ class ClaudeCodeBot:
                 )
             else:
                 # Polling mode - initialize and start polling manually
-                await self.app.initialize()
-                await self.app.start()
-                await self.app.updater.start_polling(
+                await self.application.initialize()
+                await self.application.start()
+                updater = self.application.updater
+                if updater is None:
+                    raise ClaudeCodeTelegramError("Updater unavailable for polling.")
+                await updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=True,
                 )
@@ -256,8 +266,9 @@ class ClaudeCodeBot:
 
             if self.app:
                 # Stop the updater if it's running
-                if self.app.updater.running:
-                    await self.app.updater.stop()
+                updater = self.app.updater
+                if updater is not None and updater.running:
+                    await updater.stop()
 
                 # Stop the application
                 await self.app.stop()

@@ -300,8 +300,8 @@ class MessageOrchestrator:
         if query:
             try:
                 await query.answer()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("callback answer failed, ignoring", error=str(e))
             if query.message:
                 await query.message.reply_text(message, parse_mode="HTML")
             return
@@ -325,6 +325,9 @@ class MessageOrchestrator:
             ("start", self.agentic_start),
             ("new", self.agentic_new),
             ("status", self.agentic_status),
+            ("summary", self.agentic_summary),
+            ("dashboard", self.agentic_dashboard),
+            ("sessions", self.agentic_sessions),
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
             ("restart", command.restart_command),
@@ -374,6 +377,15 @@ class MessageOrchestrator:
             group=10,
         )
 
+        # Video uploads -> sample frames -> Claude
+        app.add_handler(
+            MessageHandler(
+                filters.VIDEO | filters.VIDEO_NOTE,
+                self._inject_deps(self.agentic_video),
+            ),
+            group=10,
+        )
+
         # Voice messages -> transcribe -> Claude
         app.add_handler(
             MessageHandler(filters.VOICE, self._inject_deps(self.agentic_voice)),
@@ -393,6 +405,14 @@ class MessageOrchestrator:
             CallbackQueryHandler(
                 self._inject_deps(self._agentic_callback),
                 pattern=r"^cd:",
+            )
+        )
+
+        # sess: callbacks (for switching between sessions)
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._agentic_session_callback),
+                pattern=r"^sess:",
             )
         )
 
@@ -458,6 +478,9 @@ class MessageOrchestrator:
                 BotCommand("start", "Start the bot"),
                 BotCommand("new", "Start a fresh session"),
                 BotCommand("status", "Show session status"),
+                BotCommand("summary", "Summarize the current session"),
+                BotCommand("dashboard", "Your usage dashboard"),
+                BotCommand("sessions", "List & switch between sessions"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
                 BotCommand("restart", "Restart the bot"),
@@ -573,12 +596,232 @@ class MessageOrchestrator:
                 cost_usage = user_status.get("cost_usage", {})
                 current_cost = cost_usage.get("current", 0.0)
                 cost_str = f" · Cost: ${current_cost:.2f}"
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("cost lookup failed in /status", error=str(e))
 
         await update.message.reply_text(
             f"📂 {dir_display} · Session: {session_status}{cost_str}"
         )
+
+    async def agentic_summary(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Compact summary of the current session."""
+        user_id = update.effective_user.id
+        storage = context.bot_data.get("storage")
+        session_id = context.user_data.get("claude_session_id")
+        current_dir = context.user_data.get(
+            "current_directory", self.settings.approved_directory
+        )
+
+        if not session_id or not storage:
+            await update.message.reply_text(
+                "No active session yet. Send a message to start one."
+            )
+            return
+
+        session = await storage.sessions.get_session(session_id)
+        if not session:
+            await update.message.reply_text("No data for the current session yet.")
+            return
+
+        tool_counts: Dict[str, int] = {}
+        for tool in await storage.tools.get_session_tool_usage(session_id):
+            tool_counts[tool.tool_name] = tool_counts.get(tool.tool_name, 0) + 1
+        top_tools = sorted(tool_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        tools_line = (
+            ", ".join(f"{name} ×{n}" for name, n in top_tools) if top_tools else "—"
+        )
+
+        await update.message.reply_text(
+            "\n".join(
+                [
+                    "📋 <b>Session summary</b>",
+                    f"📂 {escape_html(str(current_dir))}",
+                    f"💬 Messages: {session.message_count} · "
+                    f"Turns: {session.total_turns}",
+                    f"💵 Cost: ${session.total_cost:.2f}",
+                    f"🛠️ Tools: {escape_html(tools_line)}",
+                ]
+            ),
+            parse_mode="HTML",
+        )
+
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(user_id, "summary", [], True)
+
+    async def agentic_dashboard(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """User usage dashboard: spend, sessions, top tools."""
+        user_id = update.effective_user.id
+        storage = context.bot_data.get("storage")
+
+        if not storage:
+            await update.message.reply_text("Storage not available.")
+            return
+
+        dashboard = await storage.get_user_dashboard(user_id)
+        if not dashboard:
+            await update.message.reply_text(
+                "No usage data yet. Send a message to get started."
+            )
+            return
+
+        stats = dashboard.get("stats", {}) or {}
+        summary = stats.get("summary", {}) or {}
+        top_tools = stats.get("top_tools", []) or []
+
+        lines = [
+            "📊 <b>Your dashboard</b>",
+            f"🗂️ Sessions: {summary.get('total_sessions') or 0} · "
+            f"💬 Messages: {summary.get('total_messages') or 0}",
+        ]
+
+        if top_tools:
+            tools_line = ", ".join(
+                f"{t.get('tool_name')} ×{t.get('usage_count')}" for t in top_tools[:5]
+            )
+            lines.append(f"🛠️ Top tools: {escape_html(tools_line)}")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(user_id, "dashboard", [], True)
+
+    @staticmethod
+    def _relative_time(dt: Any) -> str:
+        """Human-friendly 'time ago' for a datetime (best-effort)."""
+        from datetime import UTC, datetime
+
+        if not isinstance(dt, datetime):
+            return "?"
+        try:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            secs = int((datetime.now(UTC) - dt).total_seconds())
+        except Exception:
+            return "?"
+        if secs < 60:
+            return "just now"
+        if secs < 3600:
+            return f"{secs // 60}m ago"
+        if secs < 86400:
+            return f"{secs // 3600}h ago"
+        return f"{secs // 86400}d ago"
+
+    def _append_tool_footer(
+        self, formatted_messages: List[Any], claude_response: Any
+    ) -> None:
+        """Append a compact 'tools used' footer to the last message, in place."""
+        names: List[str] = []
+        for tool in getattr(claude_response, "tools_used", None) or []:
+            name = tool.get("name") if isinstance(tool, dict) else None
+            if name and name not in names:
+                names.append(name)
+        if not names:
+            return
+
+        shown = ", ".join(names[:8])
+        if len(names) > 8:
+            shown += f" +{len(names) - 8}"
+
+        for msg in reversed(formatted_messages):
+            if msg.text and msg.text.strip():
+                is_html = (msg.parse_mode or "").upper() == "HTML"
+                footer = (
+                    f"\n\n🛠️ <i>{escape_html(shown)}</i>"
+                    if is_html
+                    else f"\n\n🛠️ {shown}"
+                )
+                if len(msg.text) + len(footer) <= 4096:
+                    msg.text += footer
+                else:
+                    from .utils.formatting import FormattedMessage
+
+                    formatted_messages.append(
+                        FormattedMessage(footer.lstrip("\n"), parse_mode=msg.parse_mode)
+                    )
+                return
+
+    async def agentic_sessions(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """List the user's recent sessions with buttons to switch between them."""
+        user_id = update.effective_user.id
+        storage = context.bot_data.get("storage")
+        if not storage:
+            await update.message.reply_text("Storage not available.")
+            return
+
+        sessions = await storage.sessions.get_user_sessions(user_id, active_only=False)
+        if not sessions:
+            await update.message.reply_text(
+                "No sessions yet. Send a message to start one."
+            )
+            return
+
+        current_id = context.user_data.get("claude_session_id")
+        sessions = sessions[:8]  # most recent
+
+        lines = ["🗂️ <b>Your sessions</b>"]
+        keyboard_rows: List[list] = []  # type: ignore[type-arg]
+        for s in sessions:
+            name = Path(s.project_path).name or s.project_path
+            marker = " ◀" if s.session_id == current_id else ""
+            lines.append(
+                f"📂 <code>{escape_html(name)}/</code> · "
+                f"{s.message_count} msgs · {self._relative_time(s.last_used)}{marker}"
+            )
+            keyboard_rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"{name} ({s.message_count})",
+                        callback_data=f"sess:{s.session_id}",
+                    )
+                ]
+            )
+
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+        )
+
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(user_id, "sessions", [], True)
+
+    async def _agentic_session_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Resume the session selected from the /sessions list."""
+        query = update.callback_query
+        if not query or not query.data:
+            return
+        await query.answer()
+
+        session_id = query.data.split(":", 1)[1]
+        storage = context.bot_data.get("storage")
+        session = await storage.sessions.get_session(session_id) if storage else None
+        if not session:
+            if query.message:
+                await query.message.reply_text("Session not found.")
+            return
+
+        context.user_data["claude_session_id"] = session_id
+        context.user_data["current_directory"] = Path(session.project_path)
+        context.user_data["force_new_session"] = False
+
+        name = Path(session.project_path).name or session.project_path
+        if query.message:
+            await query.message.reply_text(
+                f"Switched to session in <code>{escape_html(name)}/</code> "
+                f"({session.message_count} msgs). Continue where you left off.",
+                parse_mode="HTML",
+            )
 
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Return effective verbose level: per-user override or global default."""
@@ -706,8 +949,8 @@ class MessageOrchestrator:
                     await asyncio.sleep(interval)
                     try:
                         await chat.send_action("typing")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("typing heartbeat send failed", error=str(e))
             except asyncio.CancelledError:
                 pass
 
@@ -818,8 +1061,8 @@ class MessageOrchestrator:
                         await progress_msg.edit_text(
                             new_text, reply_markup=reply_markup
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("progress edit failed during stream", error=str(e))
 
         return _on_stream
 
@@ -1055,6 +1298,7 @@ class MessageOrchestrator:
                 ) + "\n\n_(Interrupted by user)_"
 
             formatted_messages = formatter.format_claude_response(response_content)
+            self._append_tool_footer(formatted_messages, claude_response)
 
         except Exception as e:
             success = False
@@ -1283,6 +1527,7 @@ class MessageOrchestrator:
             formatted_messages = formatter.format_claude_response(
                 claude_response.content
             )
+            self._append_tool_footer(formatted_messages, claude_response)
 
             try:
                 await progress_msg.delete()
@@ -1384,6 +1629,51 @@ class MessageOrchestrator:
             await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
             logger.error(
                 "Claude photo processing failed", error=str(e), user_id=user_id
+            )
+
+    async def agentic_video(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Sample video frames -> Claude, minimal chrome."""
+        user_id = update.effective_user.id
+
+        features = context.bot_data.get("features")
+        video_handler = features.get_video_handler() if features else None
+
+        if not video_handler:
+            await update.message.reply_text(
+                "Video analysis is not available "
+                "(requires ffmpeg installed on the server)."
+            )
+            return
+
+        chat = update.message.chat
+        await chat.send_action("typing")
+        progress_msg = await update.message.reply_text("Sampling video frames...")
+
+        try:
+            video = update.message.video or update.message.video_note
+            processed_video = await video_handler.process_video(
+                video, update.message.caption
+            )
+
+            await progress_msg.edit_text("Working...")
+            await self._handle_agentic_media_message(
+                update=update,
+                context=context,
+                prompt=processed_video.prompt,
+                progress_msg=progress_msg,
+                user_id=user_id,
+                chat=chat,
+                images=processed_video.frames,
+            )
+
+        except Exception as e:
+            from .handlers.message import _format_error_message
+
+            await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
+            logger.error(
+                "Claude video processing failed", error=str(e), user_id=user_id
             )
 
     async def agentic_voice(
@@ -1493,6 +1783,7 @@ class MessageOrchestrator:
 
         formatter = ResponseFormatter(self.settings)
         formatted_messages = formatter.format_claude_response(claude_response.content)
+        self._append_tool_footer(formatted_messages, claude_response)
 
         try:
             await progress_msg.delete()
@@ -1698,8 +1989,8 @@ class MessageOrchestrator:
 
         try:
             await active.progress_msg.edit_text("Stopping...", reply_markup=None)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("stop progress edit failed, ignoring", error=str(e))
 
     async def _agentic_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE

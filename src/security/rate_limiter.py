@@ -73,6 +73,7 @@ class RateLimiter:
         self.cost_tracker: Dict[int, float] = defaultdict(float)
         self.cost_reset_time: Dict[int, datetime] = {}
         self.locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._checks_since_prune = 0
 
         # Calculate refill rate from config
         self.refill_rate = (
@@ -88,10 +89,39 @@ class RateLimiter:
             refill_rate=self.refill_rate,
         )
 
+    # Prune idle per-user lock/bucket state every N checks to bound memory.
+    _PRUNE_EVERY_CHECKS = 500
+    _IDLE_TTL = timedelta(hours=1)
+
+    def _maybe_prune_idle(self) -> None:
+        """Periodically drop rate-limit state for users idle beyond the TTL.
+
+        Only buckets and locks are pruned (an idle bucket is full anyway, and
+        a held lock is skipped). Cost state is left untouched.
+        """
+        self._checks_since_prune += 1
+        if self._checks_since_prune < self._PRUNE_EVERY_CHECKS:
+            return
+        self._checks_since_prune = 0
+
+        cutoff = datetime.now(UTC) - self._IDLE_TTL
+        idle_users = [
+            uid
+            for uid, bucket in list(self.request_buckets.items())
+            if bucket.last_update < cutoff
+            and not (uid in self.locks and self.locks[uid].locked())
+        ]
+        for uid in idle_users:
+            self.request_buckets.pop(uid, None)
+            self.locks.pop(uid, None)
+        if idle_users:
+            logger.debug("Pruned idle rate-limit state", count=len(idle_users))
+
     async def check_rate_limit(
         self, user_id: int, cost: float = 1.0, tokens: int = 1
     ) -> Tuple[bool, Optional[str]]:
         """Check if request is allowed under rate limits."""
+        self._maybe_prune_idle()
         async with self.locks[user_id]:
             # Check request rate limit
             rate_allowed, rate_message = self._check_request_rate(user_id, tokens)

@@ -8,14 +8,17 @@ Features:
 - Diff generation
 """
 
+import fnmatch
+import os
 import shutil
 import tarfile
+import tempfile
 import uuid
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, Iterator, List
 
 from telegram import Document
 
@@ -29,7 +32,7 @@ class ProcessedFile:
 
     type: str
     prompt: str
-    metadata: Dict[str, any]
+    metadata: Dict[str, Any]
 
 
 @dataclass
@@ -50,8 +53,8 @@ class FileHandler:
     def __init__(self, config: Settings, security: SecurityValidator):
         self.config = config
         self.security = security
-        self.temp_dir = Path("/tmp/claude_bot_files")
-        self.temp_dir.mkdir(exist_ok=True)
+        self.temp_dir = Path(tempfile.gettempdir()) / "claude_bot_files"
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
 
         # Supported code extensions
         self.code_extensions = {
@@ -329,18 +332,50 @@ class FileHandler:
             size /= 1024.0
         return f"{size:.1f}TB"
 
+    # Directories never worth walking for code analysis.
+    IGNORED_DIRS = frozenset(
+        {
+            "node_modules",
+            "__pycache__",
+            ".git",
+            "dist",
+            "build",
+            ".venv",
+            "venv",
+            ".tox",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".idea",
+            ".vscode",
+            "target",
+            ".next",
+            "vendor",
+        }
+    )
+    # Hard cap on files visited during a single codebase scan.
+    MAX_FILES_SCANNED = 20000
+
+    def _iter_files(self, directory: Path) -> Iterator[Path]:
+        """Yield files under ``directory``, pruning noisy dirs and capping count.
+
+        Prevents unbounded walks (e.g. into node_modules) from hanging the bot.
+        """
+        count = 0
+        for root, dirs, files in os.walk(directory):
+            # Prune ignored directories in place so os.walk skips them entirely.
+            dirs[:] = [d for d in dirs if d not in self.IGNORED_DIRS]
+            for fname in files:
+                yield Path(root) / fname
+                count += 1
+                if count >= self.MAX_FILES_SCANNED:
+                    return
+
     def _find_code_files(self, directory: Path) -> List[Path]:
         """Find all code files in directory"""
         code_files = []
 
-        for file_path in directory.rglob("*"):
+        for file_path in self._iter_files(directory):
             if file_path.is_file() and file_path.suffix.lower() in self.code_extensions:
-                # Skip common non-code directories
-                if any(
-                    part in file_path.parts
-                    for part in ["node_modules", "__pycache__", ".git", "dist", "build"]
-                ):
-                    continue
                 code_files.append(file_path)
 
         # Sort by importance (main files first, then by name)
@@ -386,7 +421,7 @@ class FileHandler:
         language_stats = defaultdict(int)
         file_extensions = defaultdict(int)
 
-        for file_path in directory.rglob("*"):
+        for file_path in self._iter_files(directory):
             if file_path.is_file():
                 ext = file_path.suffix.lower()
                 file_extensions[ext] += 1
@@ -437,10 +472,10 @@ class FileHandler:
             "index.html",
         ]
 
-        for pattern in patterns:
-            for file_path in directory.rglob(pattern):
-                if file_path.is_file():
-                    entry_points.append(str(file_path.relative_to(directory)))
+        wanted = set(patterns)
+        for file_path in self._iter_files(directory):
+            if file_path.name in wanted and file_path.is_file():
+                entry_points.append(str(file_path.relative_to(directory)))
 
         return entry_points
 
@@ -482,7 +517,7 @@ class FileHandler:
         """Count TODO and FIXME comments"""
         todo_count = 0
 
-        for file_path in directory.rglob("*"):
+        for file_path in self._iter_files(directory):
             if file_path.is_file() and file_path.suffix.lower() in self.code_extensions:
                 try:
                     content = file_path.read_text(encoding="utf-8", errors="ignore")
@@ -509,13 +544,15 @@ class FileHandler:
             "*.spec.ts",
         ]
 
-        for pattern in test_patterns:
-            test_files.extend(directory.rglob(pattern))
+        test_dir_names = {"test", "tests", "__tests__", "spec"}
+        for file_path in self._iter_files(directory):
+            if not file_path.is_file():
+                continue
+            in_test_dir = any(part in test_dir_names for part in file_path.parts)
+            matches_pattern = any(
+                fnmatch.fnmatch(file_path.name, pat) for pat in test_patterns
+            )
+            if in_test_dir or matches_pattern:
+                test_files.append(file_path)
 
-        # Check test directories
-        for test_dir_name in ["test", "tests", "__tests__", "spec"]:
-            test_dir = directory / test_dir_name
-            if test_dir.exists() and test_dir.is_dir():
-                test_files.extend(test_dir.rglob("*"))
-
-        return [f for f in test_files if f.is_file()]
+        return test_files
